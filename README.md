@@ -1,6 +1,10 @@
+# Proof of concept not intended for use.
+
 # pycurltx
 
 `pycurltx` provides an `httpx` transport that executes requests with `pycurl`.
+
+This is a proof of concept and is not meant to be used.
 
 ## Install
 
