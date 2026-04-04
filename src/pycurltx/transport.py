@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from tempfile import SpooledTemporaryFile
@@ -17,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - allows testing with fakes
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator
+    from typing import Callable
     from typing import BinaryIO
 
 
@@ -42,6 +44,7 @@ class _TransferContext:
     response_body: BinaryIO
     status_line: bytes | None = None
     response_headers: list[tuple[bytes, bytes]] = field(default_factory=list)
+    debug_callback: Callable[[int, bytes], None] | None = None
 
 
 @dataclass
@@ -129,6 +132,9 @@ def _configure_curl(
     verify: bool,
     follow_redirects: bool,
     user_agent: str | None,
+    verbose: bool,
+    debug_callback: Callable[[int, bytes], None] | None,
+    debug_logger: logging.Logger | None,
 ):
     _pycurl = _require_pycurl()
 
@@ -160,6 +166,19 @@ def _configure_curl(
         curl.setopt(_pycurl.TIMEOUT_MS, int(timeout * 1000))
     if user_agent:
         curl.setopt(_pycurl.USERAGENT, user_agent)
+
+    debug_enabled = verbose or debug_callback is not None or debug_logger is not None
+    if debug_enabled:
+        curl.setopt(_pycurl.VERBOSE, 1)
+        if debug_callback is not None:
+            context.debug_callback = debug_callback
+            curl.setopt(_pycurl.DEBUGFUNCTION, context.debug_callback)
+        elif debug_logger is not None:
+            def _log_debug(info_type: int, data: bytes):
+                debug_logger.debug("curl[%s] %r", info_type, data)
+
+            context.debug_callback = _log_debug
+            curl.setopt(_pycurl.DEBUGFUNCTION, context.debug_callback)
 
     headers: list[str] = []
     for key, value in request.headers.multi_items():
@@ -222,11 +241,17 @@ class PyCurlTransport(httpx.BaseTransport):
         verify: bool = True,
         follow_redirects: bool = False,
         user_agent: str | None = None,
+        verbose: bool = False,
+        debug_callback: Callable[[int, bytes], None] | None = None,
+        debug_logger: logging.Logger | None = None,
     ):
         self._timeout = timeout
         self._verify = verify
         self._follow_redirects = follow_redirects
         self._user_agent = user_agent
+        self._verbose = verbose
+        self._debug_callback = debug_callback
+        self._debug_logger = debug_logger
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         curl_response = self._perform_request(request)
@@ -257,6 +282,9 @@ class PyCurlTransport(httpx.BaseTransport):
                 verify=self._verify,
                 follow_redirects=self._follow_redirects,
                 user_agent=self._user_agent,
+                verbose=self._verbose,
+                debug_callback=self._debug_callback,
+                debug_logger=self._debug_logger,
             )
 
             curl.perform()
@@ -276,6 +304,9 @@ class PyCurlMultiTransport(httpx.BaseTransport):
         verify: bool = True,
         follow_redirects: bool = False,
         user_agent: str | None = None,
+        verbose: bool = False,
+        debug_callback: Callable[[int, bytes], None] | None = None,
+        debug_logger: logging.Logger | None = None,
         max_connections: int = 100,
         select_timeout: float = 0.1,
     ):
@@ -283,6 +314,9 @@ class PyCurlMultiTransport(httpx.BaseTransport):
         self._verify = verify
         self._follow_redirects = follow_redirects
         self._user_agent = user_agent
+        self._verbose = verbose
+        self._debug_callback = debug_callback
+        self._debug_logger = debug_logger
         self._max_connections = max_connections
         self._select_timeout = select_timeout
 
@@ -384,6 +418,9 @@ class PyCurlMultiTransport(httpx.BaseTransport):
                 verify=self._verify,
                 follow_redirects=self._follow_redirects,
                 user_agent=self._user_agent,
+                verbose=self._verbose,
+                debug_callback=self._debug_callback,
+                debug_logger=self._debug_logger,
             )
             self._inflight[curl] = (task, context)
             multi.add_handle(curl)
@@ -451,12 +488,18 @@ class PyCurlAsyncTransport(httpx.AsyncBaseTransport):
         verify: bool = True,
         follow_redirects: bool = False,
         user_agent: str | None = None,
+        verbose: bool = False,
+        debug_callback: Callable[[int, bytes], None] | None = None,
+        debug_logger: logging.Logger | None = None,
     ):
         self._sync_transport = PyCurlTransport(
             timeout=timeout,
             verify=verify,
             follow_redirects=follow_redirects,
             user_agent=user_agent,
+            verbose=verbose,
+            debug_callback=debug_callback,
+            debug_logger=debug_logger,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -482,12 +525,18 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
         verify: bool = True,
         follow_redirects: bool = False,
         user_agent: str | None = None,
+        verbose: bool = False,
+        debug_callback: Callable[[int, bytes], None] | None = None,
+        debug_logger: logging.Logger | None = None,
         max_connections: int = 100,
     ):
         self._timeout = timeout
         self._verify = verify
         self._follow_redirects = follow_redirects
         self._user_agent = user_agent
+        self._verbose = verbose
+        self._debug_callback = debug_callback
+        self._debug_logger = debug_logger
         self._max_connections = max_connections
 
         self._multi: pycurl.CurlMulti | None = None
@@ -527,6 +576,9 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
                 verify=self._verify,
                 follow_redirects=self._follow_redirects,
                 user_agent=self._user_agent,
+                verbose=self._verbose,
+                debug_callback=self._debug_callback,
+                debug_logger=self._debug_logger,
             )
             self._transfers[curl] = (request, context, future)
             multi.add_handle(curl)

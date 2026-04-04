@@ -24,6 +24,11 @@ with httpx.Client(transport=transport) as client:
     response = client.get("https://example.com")
     print(response.status_code)
     print(response.text)
+
+debug_transport = PyCurlTransport(
+    verbose=True,
+    debug_callback=lambda info_type, data: print(info_type, data),
+)
 ```
 
 For higher concurrency in threaded use, use `PyCurlMultiTransport`:
@@ -76,3 +81,4 @@ async with httpx.AsyncClient(transport=transport) as client:
 - Response bodies are streamed from a spooled temporary file.
 - The async transport performs curl operations in a worker thread.
 - `PyCurlAsyncMultiSocketTransport` integrates curl sockets with the asyncio event loop.
+- Verbose curl logging is supported via `verbose=True` and optional `debug_callback`.

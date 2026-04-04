@@ -107,6 +107,8 @@ def _install_fake_pycurl(monkeypatch: pytest.MonkeyPatch, behavior=None):
         SSL_VERIFYHOST="SSL_VERIFYHOST",
         TIMEOUT_MS="TIMEOUT_MS",
         USERAGENT="USERAGENT",
+        VERBOSE="VERBOSE",
+        DEBUGFUNCTION="DEBUGFUNCTION",
         HTTPHEADER="HTTPHEADER",
         HTTPGET="HTTPGET",
         NOBODY="NOBODY",
@@ -226,6 +228,30 @@ def test_maps_pycurl_error_to_httpx(monkeypatch: pytest.MonkeyPatch):
 
     with pytest.raises(httpx.TransportError, match=r"pycurl error 7: failed connect"):
         tx.handle_request(request)
+
+
+def test_verbose_debug_callback(monkeypatch: pytest.MonkeyPatch):
+    debug_messages: list[tuple[int, bytes]] = []
+
+    def behavior(curl: _FakeCurl):
+        assert curl.options[curl.module.VERBOSE] == 1
+        debug = curl.options[curl.module.DEBUGFUNCTION]
+        debug(0, b"hello debug")
+        header = curl.options[curl.module.HEADERFUNCTION]
+        writer = curl.options[curl.module.WRITEFUNCTION]
+        header(b"HTTP/1.1 200 OK\r\n")
+        header(b"\r\n")
+        writer(b"ok")
+
+    _install_fake_pycurl(monkeypatch, behavior=behavior)
+    tx = transport.PyCurlTransport(
+        verbose=True,
+        debug_callback=lambda info_type, data: debug_messages.append((info_type, data)),
+    )
+    response = tx.handle_request(httpx.Request("GET", "https://example.com"))
+
+    assert response.read() == b"ok"
+    assert debug_messages == [(0, b"hello debug")]
 
 
 def test_multi_transport_handles_concurrent_calls(monkeypatch: pytest.MonkeyPatch):
