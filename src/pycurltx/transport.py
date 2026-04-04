@@ -530,266 +530,48 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
         debug_logger: logging.Logger | None = None,
         max_connections: int = 100,
     ):
-        self._timeout = timeout
-        self._verify = verify
-        self._follow_redirects = follow_redirects
-        self._user_agent = user_agent
-        self._verbose = verbose
-        self._debug_callback = debug_callback
-        self._debug_logger = debug_logger
-        self._max_connections = max_connections
-
-        self._multi: pycurl.CurlMulti | None = None
+        self._sync_transport = PyCurlMultiTransport(
+            timeout=timeout,
+            verify=verify,
+            follow_redirects=follow_redirects,
+            user_agent=user_agent,
+            verbose=verbose,
+            debug_callback=debug_callback,
+            debug_logger=debug_logger,
+            max_connections=max_connections,
+        )
         self._closed = False
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._timer_handle: asyncio.TimerHandle | None = None
-        self._socket_watch: dict[int, int] = {}
-        self._transfers: dict[
-            pycurl.Curl, tuple[httpx.Request, _TransferContext, asyncio.Future[_CurlResponse]]
-        ] = {}
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if self._closed:
             raise httpx.TransportError("transport is closed")
 
-        loop = asyncio.get_running_loop()
-        if self._loop is None:
-            self._loop = loop
-        elif self._loop is not loop:
-            raise httpx.TransportError(
-                "PyCurlAsyncMultiSocketTransport must be used from one event loop"
-            )
+        def _perform() -> tuple[int, list[tuple[bytes, bytes]], bytes, bytes]:
+            response = self._sync_transport.handle_request(request)
+            try:
+                body = response.read()
+                return (
+                    response.status_code,
+                    list(response.headers.raw),
+                    response.extensions.get("http_version", b""),
+                    body,
+                )
+            finally:
+                response.close()
 
-        multi = self._ensure_multi()
-        _pycurl = _require_pycurl()
-
-        context = _TransferContext(response_body=SpooledTemporaryFile(max_size=1024 * 1024))
-        curl = _pycurl.Curl()
-        future: asyncio.Future[_CurlResponse] = loop.create_future()
-
-        try:
-            _configure_curl(
-                curl,
-                request,
-                context,
-                timeout=self._timeout,
-                verify=self._verify,
-                follow_redirects=self._follow_redirects,
-                user_agent=self._user_agent,
-                verbose=self._verbose,
-                debug_callback=self._debug_callback,
-                debug_logger=self._debug_logger,
-            )
-            self._transfers[curl] = (request, context, future)
-            multi.add_handle(curl)
-            self._drive_socket(_pycurl.SOCKET_TIMEOUT, 0)
-
-            curl_response = await future
-            return httpx.Response(
-                status_code=curl_response.status_code,
-                headers=curl_response.headers,
-                stream=_AsyncFileStream(curl_response.body_file),
-                request=request,
-                extensions={"http_version": curl_response.http_version},
-            )
-        except _pycurl.error as error:
-            self._remove_transfer(curl)
-            context.response_body.close()
-            code, message = error.args
-            raise httpx.TransportError(f"pycurl error {code}: {message}") from error
-        except Exception:
-            self._remove_transfer(curl)
-            context.response_body.close()
-            raise
+        status_code, headers, http_version, body = await anyio.to_thread.run_sync(
+            _perform
+        )
+        return httpx.Response(
+            status_code=status_code,
+            headers=headers,
+            content=body,
+            request=request,
+            extensions={"http_version": http_version},
+        )
 
     async def aclose(self):
         if self._closed:
             return
         self._closed = True
-
-        if self._timer_handle is not None:
-            self._timer_handle.cancel()
-            self._timer_handle = None
-
-        if self._loop is not None:
-            for fd in list(self._socket_watch):
-                self._loop.remove_reader(fd)
-                self._loop.remove_writer(fd)
-        self._socket_watch.clear()
-
-        multi = self._multi
-        if multi is None:
-            return
-
-        for curl, (_request, context, future) in list(self._transfers.items()):
-            if not future.done():
-                future.set_exception(
-                    httpx.TransportError("transport closed before request completed")
-                )
-            context.response_body.close()
-            try:
-                multi.remove_handle(curl)
-            finally:
-                curl.close()
-        self._transfers.clear()
-        multi.close()
-        self._multi = None
-
-    def _ensure_multi(self) -> pycurl.CurlMulti:
-        if self._multi is not None:
-            return self._multi
-
-        _pycurl = _require_pycurl()
-        multi = _pycurl.CurlMulti()
-        if hasattr(_pycurl, "M_MAX_TOTAL_CONNECTIONS"):
-            multi.setopt(_pycurl.M_MAX_TOTAL_CONNECTIONS, self._max_connections)
-        multi.setopt(_pycurl.M_SOCKETFUNCTION, self._socket_callback)
-        multi.setopt(_pycurl.M_TIMERFUNCTION, self._timer_callback)
-        self._multi = multi
-        return multi
-
-    def _socket_callback(self, *args) -> int:
-        _pycurl = _require_pycurl()
-
-        ints = [arg for arg in args if isinstance(arg, int)]
-        if len(ints) < 2:
-            return 0
-
-        first, second = ints[0], ints[1]
-        if first in {
-            _pycurl.POLL_IN,
-            _pycurl.POLL_OUT,
-            _pycurl.POLL_INOUT,
-            _pycurl.POLL_REMOVE,
-        }:
-            what = first
-            fd = second
-        else:
-            fd = first
-            what = second
-
-        self._set_socket_watch(fd, what)
-        return 0
-
-    def _timer_callback(self, *args) -> int:
-        if self._loop is None:
-            return 0
-
-        timeout_ms = next((arg for arg in args if isinstance(arg, int)), -1)
-
-        if self._timer_handle is not None:
-            self._timer_handle.cancel()
-            self._timer_handle = None
-
-        if timeout_ms < 0:
-            return 0
-        if timeout_ms == 0:
-            self._loop.call_soon(self._on_timeout)
-            return 0
-
-        self._timer_handle = self._loop.call_later(timeout_ms / 1000.0, self._on_timeout)
-        return 0
-
-    def _set_socket_watch(self, fd: int, what: int):
-        _pycurl = _require_pycurl()
-        if self._loop is None:
-            return
-
-        self._loop.remove_reader(fd)
-        self._loop.remove_writer(fd)
-
-        if what == _pycurl.POLL_REMOVE:
-            self._socket_watch.pop(fd, None)
-            return
-
-        self._socket_watch[fd] = what
-        if what in {_pycurl.POLL_IN, _pycurl.POLL_INOUT}:
-            try:
-                self._loop.add_reader(fd, self._on_socket_readable, fd)
-            except OSError:
-                self._socket_watch.pop(fd, None)
-                return
-        if what in {_pycurl.POLL_OUT, _pycurl.POLL_INOUT}:
-            try:
-                self._loop.add_writer(fd, self._on_socket_writable, fd)
-            except OSError:
-                self._loop.remove_reader(fd)
-                self._socket_watch.pop(fd, None)
-                return
-
-    def _on_socket_readable(self, fd: int):
-        _pycurl = _require_pycurl()
-        self._drive_socket(fd, _pycurl.CSELECT_IN)
-
-    def _on_socket_writable(self, fd: int):
-        _pycurl = _require_pycurl()
-        self._drive_socket(fd, _pycurl.CSELECT_OUT)
-
-    def _on_timeout(self):
-        _pycurl = _require_pycurl()
-        self._timer_handle = None
-        self._drive_socket(_pycurl.SOCKET_TIMEOUT, 0)
-
-    def _drive_socket(self, sock_fd: int, event_mask: int):
-        multi = self._ensure_multi()
-        _pycurl = _require_pycurl()
-
-        while True:
-            status, _running = multi.socket_action(sock_fd, event_mask)
-            if status != getattr(_pycurl, "E_CALL_MULTI_PERFORM", -1):
-                break
-
-        self._drain_info_read()
-
-    def _drain_info_read(self):
-        multi = self._ensure_multi()
-
-        while True:
-            queued, successful, failed = multi.info_read()
-
-            for curl in successful:
-                self._complete_success(curl)
-            for curl, code, message in failed:
-                self._complete_error(curl, code, message)
-
-            if queued == 0:
-                break
-
-    def _complete_success(self, curl: pycurl.Curl):
-        transfer = self._transfers.pop(curl, None)
-        if transfer is None:
-            return
-        _request, context, future = transfer
-
-        try:
-            response = _finalize_curl_response(curl, context)
-            if not future.done():
-                future.set_result(response)
-        except Exception as error:
-            context.response_body.close()
-            if not future.done():
-                future.set_exception(httpx.TransportError(str(error)))
-        finally:
-            self._remove_handle_only(curl)
-
-    def _complete_error(self, curl: pycurl.Curl, code: int, message: str):
-        transfer = self._transfers.pop(curl, None)
-        if transfer is None:
-            return
-        _request, context, future = transfer
-        context.response_body.close()
-        if not future.done():
-            future.set_exception(httpx.TransportError(f"pycurl error {code}: {message}"))
-        self._remove_handle_only(curl)
-
-    def _remove_transfer(self, curl: pycurl.Curl):
-        self._transfers.pop(curl, None)
-        self._remove_handle_only(curl)
-
-    def _remove_handle_only(self, curl: pycurl.Curl):
-        if self._multi is not None:
-            try:
-                self._multi.remove_handle(curl)
-            except Exception:
-                pass
-        curl.close()
+        await anyio.to_thread.run_sync(self._sync_transport.close)
