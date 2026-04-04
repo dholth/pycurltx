@@ -53,9 +53,26 @@ async with httpx.AsyncClient(transport=transport) as client:
     response = await client.get("https://example.com")
 ```
 
+For event-loop integrated async concurrency, use `PyCurlAsyncMultiSocketTransport`:
+
+```python
+import asyncio
+import httpx
+from pycurltx import PyCurlAsyncMultiSocketTransport
+
+transport = PyCurlAsyncMultiSocketTransport(max_connections=100)
+
+async with httpx.AsyncClient(transport=transport) as client:
+    responses = await asyncio.gather(
+        client.get("https://example.com/one"),
+        client.get("https://example.com/two"),
+    )
+```
+
 ## Notes
 
 - This transport is implemented on top of pycurl's easy interface.
 - Request bodies can be streamed from iterable byte chunks.
 - Response bodies are streamed from a spooled temporary file.
 - The async transport performs curl operations in a worker thread.
+- `PyCurlAsyncMultiSocketTransport` integrates curl sockets with the asyncio event loop.

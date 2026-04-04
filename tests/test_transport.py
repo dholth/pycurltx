@@ -43,19 +43,31 @@ def _install_fake_pycurl(monkeypatch: pytest.MonkeyPatch, behavior=None):
             self._handles: list[_FakeCurl] = []
             self._completed: list[_FakeCurl] = []
             self._failed: list[tuple[_FakeCurl, int, str]] = []
+            self._socket_callback = None
+            self._timer_callback = None
+            self._processed: set[_FakeCurl] = set()
 
-        def setopt(self, _option: object, _value: object):
-            return
+        def setopt(self, option: object, value: object):
+            if option == fake_module.M_SOCKETFUNCTION:
+                self._socket_callback = value
+            elif option == fake_module.M_TIMERFUNCTION:
+                self._timer_callback = value
 
         def add_handle(self, curl: _FakeCurl):
             self._handles.append(curl)
+            self._processed.discard(curl)
+            if self._socket_callback is not None:
+                self._socket_callback(fake_module.POLL_IN, 10, self, None)
+            if self._timer_callback is not None:
+                self._timer_callback(0)
 
         def remove_handle(self, curl: _FakeCurl):
             if curl in self._handles:
                 self._handles.remove(curl)
+            self._processed.discard(curl)
 
         def perform(self) -> tuple[int, int]:
-            pending = list(self._handles)
+            pending = [curl for curl in self._handles if curl not in self._processed]
             for curl in pending:
                 try:
                     action = getattr(curl.module, "behavior", None)
@@ -66,7 +78,11 @@ def _install_fake_pycurl(monkeypatch: pytest.MonkeyPatch, behavior=None):
                     self._failed.append((curl, code, message))
                 else:
                     self._completed.append(curl)
+                self._processed.add(curl)
             return 0, len(self._handles)
+
+        def socket_action(self, _sockfd: int, _events: int) -> tuple[int, int]:
+            return self.perform()
 
         def info_read(self):
             completed = self._completed
@@ -103,6 +119,15 @@ def _install_fake_pycurl(monkeypatch: pytest.MonkeyPatch, behavior=None):
         RESPONSE_CODE="RESPONSE_CODE",
         E_CALL_MULTI_PERFORM=1,
         M_MAX_TOTAL_CONNECTIONS="M_MAX_TOTAL_CONNECTIONS",
+        M_SOCKETFUNCTION="M_SOCKETFUNCTION",
+        M_TIMERFUNCTION="M_TIMERFUNCTION",
+        POLL_IN=1,
+        POLL_OUT=2,
+        POLL_INOUT=3,
+        POLL_REMOVE=4,
+        CSELECT_IN=1,
+        CSELECT_OUT=2,
+        SOCKET_TIMEOUT=-1,
         error=_FakeCurlError,
         behavior=behavior,
     )
@@ -227,3 +252,22 @@ def test_multi_transport_handles_concurrent_calls(monkeypatch: pytest.MonkeyPatc
     assert first.result() == b"https://example.com/one"
     assert second.result() == b"https://example.com/two"
     tx.close()
+
+
+@pytest.mark.anyio
+async def test_async_multi_socket_transport(monkeypatch: pytest.MonkeyPatch):
+    def behavior(curl: _FakeCurl):
+        header = curl.options[curl.module.HEADERFUNCTION]
+        writer = curl.options[curl.module.WRITEFUNCTION]
+        header(b"HTTP/1.1 200 OK\r\n")
+        header(b"\r\n")
+        writer(b"socket")
+
+    _install_fake_pycurl(monkeypatch, behavior=behavior)
+    tx = transport.PyCurlAsyncMultiSocketTransport()
+    request = httpx.Request("GET", "https://example.com/socket")
+
+    response = await tx.handle_async_request(request)
+
+    assert await response.aread() == b"socket"
+    await tx.aclose()
