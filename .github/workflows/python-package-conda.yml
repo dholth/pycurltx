@@ -20,7 +20,7 @@ jobs:
         echo $CONDA/bin >> $GITHUB_PATH
     - name: Install dependencies
       run: |
-        conda install conda-pypi editables pytest
+        conda install conda-pypi editables pytest trio
         conda pypi install -e .
     - name: Test with pytest
       run: |
