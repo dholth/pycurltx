@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
 from dataclasses import dataclass, field
 from tempfile import SpooledTemporaryFile
-from threading import Condition, Event, Thread
 from typing import TYPE_CHECKING
 
 import anyio
@@ -18,10 +16,6 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator
     from typing import BinaryIO, Callable
-
-
-def _require_pycurl():
-    return pycurl
 
 
 @dataclass
@@ -39,14 +33,6 @@ class _TransferContext:
     status_line: bytes | None = None
     response_headers: list[tuple[bytes, bytes]] = field(default_factory=list)
     debug_callback: Callable[[int, bytes], None] | None = None
-
-
-@dataclass
-class _PendingTask:
-    request: httpx.Request
-    done: Event
-    response: httpx.Response | None = None
-    error: Exception | None = None
 
 
 class _RequestBodyReader:
@@ -131,8 +117,6 @@ def _configure_curl(
     debug_callback: Callable[[int, bytes], None] | None,
     debug_logger: logging.Logger | None,
 ):
-    _pycurl = _require_pycurl()
-
     def header_callback(chunk: bytes) -> int:
         log.debug("header %s", chunk)
         line = chunk.rstrip(b"\r\n")
@@ -230,7 +214,6 @@ def _configure_curl(
 def _finalize_curl_response(
     curl: pycurl.Curl, context: _TransferContext
 ) -> _CurlResponse:
-    _pycurl = _require_pycurl()
     status_code = int(curl.getinfo(_pycurl.RESPONSE_CODE))
     reason_phrase, http_version = _parse_status_line(context.status_line)
     context.response_body.seek(0)
@@ -241,349 +224,6 @@ def _finalize_curl_response(
         body_file=context.response_body,
         http_version=http_version,
     )
-
-
-class PyCurlTransport(httpx.BaseTransport):
-    def __init__(
-        self,
-        timeout: float | None = None,
-        verify: bool = True,
-        follow_redirects: bool = False,
-        user_agent: str | None = None,
-        verbose: bool = False,
-        debug_callback: Callable[[int, bytes], None] | None = None,
-        debug_logger: logging.Logger | None = None,
-    ):
-        self._timeout = timeout
-        self._verify = verify
-        self._follow_redirects = follow_redirects
-        self._user_agent = user_agent
-        self._verbose = verbose
-        self._debug_callback = debug_callback
-        self._debug_logger = debug_logger
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        curl_response = self._perform_request(request)
-        return httpx.Response(
-            status_code=curl_response.status_code,
-            headers=curl_response.headers,
-            stream=_SyncFileStream(curl_response.body_file),
-            request=request,
-            extensions={"http_version": curl_response.http_version},
-        )
-
-    def close(self):
-        return
-
-    def _perform_request(self, request: httpx.Request) -> _CurlResponse:
-        _pycurl = _require_pycurl()
-        context = _TransferContext(
-            response_body=SpooledTemporaryFile(max_size=1024 * 1024)
-        )
-
-        curl = _pycurl.Curl()
-        try:
-            _configure_curl(
-                curl,
-                request,
-                context,
-                timeout=self._timeout,
-                verify=self._verify,
-                follow_redirects=self._follow_redirects,
-                user_agent=self._user_agent,
-                verbose=self._verbose,
-                debug_callback=self._debug_callback,
-                debug_logger=self._debug_logger,
-            )
-
-            curl.perform()
-            return _finalize_curl_response(curl, context)
-        except _pycurl.error as error:
-            context.response_body.close()
-            code, message = error.args
-            raise httpx.TransportError(f"pycurl error {code}: {message}") from error
-        finally:
-            curl.close()
-
-
-class PyCurlMultiTransport(httpx.BaseTransport):
-    def __init__(
-        self,
-        timeout: float | None = None,
-        verify: bool = True,
-        follow_redirects: bool = False,
-        user_agent: str | None = None,
-        verbose: bool = False,
-        debug_callback: Callable[[int, bytes], None] | None = None,
-        debug_logger: logging.Logger | None = None,
-        max_connections: int = 100,
-        select_timeout: float = 0.1,
-    ):
-        self._timeout = timeout
-        self._verify = verify
-        self._follow_redirects = follow_redirects
-        self._user_agent = user_agent
-        self._verbose = verbose
-        self._debug_callback = debug_callback
-        self._debug_logger = debug_logger
-        self._max_connections = max_connections
-        self._select_timeout = select_timeout
-
-        self._condition = Condition()
-        self._pending: deque[_PendingTask] = deque()
-        self._inflight: dict[pycurl.Curl, tuple[_PendingTask, _TransferContext]] = {}
-        self._thread: Thread | None = None
-        self._closed = False
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        done = Event()
-        task = _PendingTask(request=request, done=done)
-
-        with self._condition:
-            if self._closed:
-                raise httpx.TransportError("transport is closed")
-            if self._thread is None:
-                self._thread = Thread(target=self._run_loop, daemon=True)
-                self._thread.start()
-            self._pending.append(task)
-            self._condition.notify_all()
-
-        task.done.wait()
-        if task.error is not None:
-            raise task.error
-        if task.response is None:
-            raise httpx.TransportError("pycurl multi request failed without response")
-        return task.response
-
-    def close(self):
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            while self._pending:
-                task = self._pending.popleft()
-                task.error = httpx.TransportError("transport is closed")
-                task.done.set()
-            self._condition.notify_all()
-
-        if self._thread is not None:
-            self._thread.join()
-
-    def _run_loop(self):
-        _pycurl = _require_pycurl()
-        multi = _pycurl.CurlMulti()
-        if hasattr(_pycurl, "M_MAX_TOTAL_CONNECTIONS"):
-            multi.setopt(_pycurl.M_MAX_TOTAL_CONNECTIONS, self._max_connections)
-
-        try:
-            while True:
-                with self._condition:
-                    while not self._pending and not self._inflight and not self._closed:
-                        self._condition.wait()
-                    if self._closed and not self._inflight and not self._pending:
-                        break
-
-                    while self._pending:
-                        task = self._pending.popleft()
-                        self._enqueue_task(multi, task)
-
-                while True:
-                    status, _running = multi.perform()
-                    if status != getattr(_pycurl, "E_CALL_MULTI_PERFORM", -1):
-                        break
-
-                self._drain_messages(multi)
-
-                with self._condition:
-                    has_work = bool(self._pending or self._inflight)
-                if has_work:
-                    multi.select(self._select_timeout)
-        finally:
-            for curl, (task, context) in list(self._inflight.items()):
-                context.response_body.close()
-                task.error = httpx.TransportError(
-                    "transport closed before request completed"
-                )
-                task.done.set()
-                try:
-                    multi.remove_handle(curl)
-                finally:
-                    curl.close()
-            self._inflight.clear()
-            multi.close()
-
-    def _enqueue_task(self, multi: pycurl.CurlMulti, task: _PendingTask):
-        _pycurl = _require_pycurl()
-        curl = _pycurl.Curl()
-        context = _TransferContext(
-            response_body=SpooledTemporaryFile(max_size=1024 * 1024)
-        )
-        try:
-            _configure_curl(
-                curl,
-                task.request,
-                context,
-                timeout=self._timeout,
-                verify=self._verify,
-                follow_redirects=self._follow_redirects,
-                user_agent=self._user_agent,
-                verbose=self._verbose,
-                debug_callback=self._debug_callback,
-                debug_logger=self._debug_logger,
-            )
-            self._inflight[curl] = (task, context)
-            multi.add_handle(curl)
-        except Exception as error:
-            context.response_body.close()
-            curl.close()
-            task.error = (
-                error
-                if isinstance(error, httpx.TransportError)
-                else httpx.TransportError(str(error))
-            )
-            task.done.set()
-
-    def _drain_messages(self, multi: pycurl.CurlMulti):
-        while True:
-            queued, successful, failed = multi.info_read()
-
-            for curl in successful:
-                self._complete_success(multi, curl)
-            for curl, code, message in failed:
-                self._complete_error(multi, curl, code, message)
-
-            if queued == 0:
-                break
-
-    def _complete_success(self, multi: pycurl.CurlMulti, curl: pycurl.Curl):
-        task, context = self._inflight.pop(curl)
-        try:
-            curl_response = _finalize_curl_response(curl, context)
-            task.response = httpx.Response(
-                status_code=curl_response.status_code,
-                headers=curl_response.headers,
-                stream=_SyncFileStream(curl_response.body_file),
-                request=task.request,
-                extensions={"http_version": curl_response.http_version},
-            )
-            task.done.set()
-        except Exception as error:
-            context.response_body.close()
-            task.error = httpx.TransportError(str(error))
-            task.done.set()
-        finally:
-            multi.remove_handle(curl)
-            curl.close()
-
-    def _complete_error(
-        self,
-        multi: pycurl.CurlMulti,
-        curl: pycurl.Curl,
-        code: int,
-        message: str,
-    ):
-        task, context = self._inflight.pop(curl)
-        context.response_body.close()
-        task.error = httpx.TransportError(f"pycurl error {code}: {message}")
-        task.done.set()
-        multi.remove_handle(curl)
-        curl.close()
-
-
-class PyCurlAsyncTransport(httpx.AsyncBaseTransport):
-    def __init__(
-        self,
-        timeout: float | None = None,
-        verify: bool = True,
-        follow_redirects: bool = False,
-        user_agent: str | None = None,
-        verbose: bool = False,
-        debug_callback: Callable[[int, bytes], None] | None = None,
-        debug_logger: logging.Logger | None = None,
-    ):
-        self._sync_transport = PyCurlTransport(
-            timeout=timeout,
-            verify=verify,
-            follow_redirects=follow_redirects,
-            user_agent=user_agent,
-            verbose=verbose,
-            debug_callback=debug_callback,
-            debug_logger=debug_logger,
-        )
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        curl_response = await anyio.to_thread.run_sync(
-            self._sync_transport._perform_request, request
-        )
-        return httpx.Response(
-            status_code=curl_response.status_code,
-            headers=curl_response.headers,
-            stream=_AsyncFileStream(curl_response.body_file),
-            request=request,
-            extensions={"http_version": curl_response.http_version},
-        )
-
-    async def aclose(self):
-        self._sync_transport.close()
-
-
-class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
-    def __init__(
-        self,
-        timeout: float | None = None,
-        verify: bool = True,
-        follow_redirects: bool = False,
-        user_agent: str | None = None,
-        verbose: bool = False,
-        debug_callback: Callable[[int, bytes], None] | None = None,
-        debug_logger: logging.Logger | None = None,
-        max_connections: int = 100,
-    ):
-        self._sync_transport = PyCurlMultiTransport(
-            timeout=timeout,
-            verify=verify,
-            follow_redirects=follow_redirects,
-            user_agent=user_agent,
-            verbose=verbose,
-            debug_callback=debug_callback,
-            debug_logger=debug_logger,
-            max_connections=max_connections,
-        )
-        self._closed = False
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if self._closed:
-            raise httpx.TransportError("transport is closed")
-
-        def _perform() -> tuple[int, list[tuple[bytes, bytes]], bytes, bytes]:
-            response = self._sync_transport.handle_request(request)
-            try:
-                body = response.read()
-                return (
-                    response.status_code,
-                    list(response.headers.raw),
-                    response.extensions.get("http_version", b""),
-                    body,
-                )
-            finally:
-                response.close()
-
-        status_code, headers, http_version, body = await anyio.to_thread.run_sync(
-            _perform
-        )
-        return httpx.Response(
-            status_code=status_code,
-            headers=headers,
-            content=body,
-            request=request,
-            extensions={"http_version": http_version},
-        )
-
-    async def aclose(self):
-        if self._closed:
-            return
-        self._closed = True
-        await anyio.to_thread.run_sync(self._sync_transport.close)
 
 
 class PyCurlTx(httpx.AsyncBaseTransport):
@@ -686,14 +326,8 @@ class PyCurlTx(httpx.AsyncBaseTransport):
     # client" is called (but it isn't when client is used without with
     # statement)
 
-    _timer_callbacks = 0
-
     def _timer_callback(self, timeout_ms: int) -> None:
         log.debug("timer_callback: timeout=%d", timeout_ms)
-        self._timer_callbacks += 1
-        if self._timer_callbacks > 100:  # XXX TODO
-            log.debug("No more timers allowed")
-            return
         self._callback_tasks.append(lambda: self._do_timer(timeout_ms))
 
     async def _do_timer(self, timeout_ms: int) -> None:
@@ -791,6 +425,11 @@ class PyCurlTx(httpx.AsyncBaseTransport):
                 extensions={"http_version": curl_response.http_version},
             )
             return response
+
+        except _pycurl.error as error:  # XXX also in other curl API calls?
+            context.response_body.close()
+            code, message = error.args
+            raise httpx.TransportError(f"pycurl error {code}: {message}") from error
 
         except Exception as error:
             context.response_body.close()
