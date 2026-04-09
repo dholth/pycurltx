@@ -1,32 +1,25 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import deque
 from dataclasses import dataclass, field
 from tempfile import SpooledTemporaryFile
-from threading import Condition, Event, Thread
 from typing import TYPE_CHECKING
+from threading import Condition, Event, Thread
 
 import anyio
 import httpx
+import pycurl
+import pycurl as _pycurl
 
-try:
-    import pycurl
-except ModuleNotFoundError:  # pragma: no cover - allows testing with fakes
-    pycurl = None
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator
-    from typing import Callable
-    from typing import BinaryIO
+    from typing import BinaryIO, Callable
 
 
 def _require_pycurl():
-    if pycurl is None:
-        raise httpx.TransportError(
-            "pycurl is not installed; install pycurl to use pycurltx transports"
-        )
     return pycurl
 
 
@@ -139,6 +132,7 @@ def _configure_curl(
     _pycurl = _require_pycurl()
 
     def header_callback(chunk: bytes) -> int:
+        log.debug("header %s", chunk)
         line = chunk.rstrip(b"\r\n")
         if not line:
             return len(chunk)
@@ -152,8 +146,12 @@ def _configure_curl(
         return len(chunk)
 
     def write_callback(chunk: bytes) -> int:
+        log.debug("body %s", chunk)
         context.response_body.write(chunk)
         return len(chunk)
+
+    # default curl user agent is blocked by sites
+    curl.setopt(_pycurl.USERAGENT, "pycurltx/0.0.1+curl")
 
     curl.setopt(_pycurl.URL, str(request.url))
     curl.setopt(_pycurl.WRITEFUNCTION, write_callback)
@@ -174,6 +172,7 @@ def _configure_curl(
             context.debug_callback = debug_callback
             curl.setopt(_pycurl.DEBUGFUNCTION, context.debug_callback)
         elif debug_logger is not None:
+
             def _log_debug(info_type: int, data: bytes):
                 debug_logger.debug("curl[%s] %r", info_type, data)
 
@@ -216,6 +215,8 @@ def _configure_curl(
         curl.setopt(_pycurl.UPLOAD, 1)
         if size >= 0:
             curl.setopt(_pycurl.INFILESIZE_LARGE, size)
+
+    curl.userstuff = "hello"
 
 
 def _finalize_curl_response(
@@ -575,3 +576,207 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
             return
         self._closed = True
         await anyio.to_thread.run_sync(self._sync_transport.close)
+
+
+class PyCurlTx(httpx.AsyncBaseTransport):
+    def __init__(
+        self,
+        timeout: float | None = None,
+        verify: bool = True,
+        follow_redirects: bool = False,
+        user_agent: str | None = None,
+        verbose: bool = False,
+        debug_callback: Callable[[int, bytes], None] | None = None,
+        debug_logger: logging.Logger | None = None,
+        max_connections: int = 100,
+    ):
+        self._timeout = timeout
+        self._verify = verify
+        self._follow_redirects = follow_redirects
+        self._user_agent = user_agent
+        self._verbose = verbose
+        self._debug_callback = debug_callback
+        self._debug_logger = debug_logger
+        self._max_connections = max_connections
+        self._closed = False
+
+        # anyio
+        # _tg holds task driving CurlMulti()
+        self._tg = None
+
+        # store callbacks here, clean up this list after any curl function is
+        # called because it might have triggered callbacks.
+        self._callback_tasks = []
+        self._sockets = {}
+
+        # curl_multi (could we be threadlocal or loop-local)
+        self.__curl_multi = pycurl.CurlMulti()
+        self.__curl_multi.setopt(pycurl.M_SOCKETFUNCTION, self._socket_callback)
+        self.__curl_multi.setopt(pycurl.M_TIMERFUNCTION, self._timer_callback)
+        self.__curl_multi.setopt(pycurl.M_MAX_TOTAL_CONNECTIONS, self._max_connections)
+
+    # Must enter transport for it to work
+    async def __aenter__(self):
+        tg = anyio.create_task_group()
+        self._tg = await tg.__aenter__()
+        assert tg is self._tg
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        # AsyncContextManagerMixin is designed to help with this pattern...
+        return await self._tg.__aexit__(exc_type, exc_val, exc_tb)
+
+    @property
+    def _curl_multi(self) -> pycurl.CurlMulti:
+        return self.__curl_multi
+
+    def _curl(self):
+        """
+        Return new or free pycurl.Curl()
+        """
+        return pycurl.Curl()
+
+    def _socket_bitmask_decode(self, ev_bitmask: int):
+        flags = []
+        for sym in ("POLL_IN", "POLL_OUT", "POLL_INOUT", "POLL_REMOVE"):
+            # inout is 3 0b11
+            if (ev_bitmask ^ getattr(pycurl, sym)) == 0:
+                flags.append(sym)
+        return f"{bin(ev_bitmask)} {'|'.join(flags)}"
+
+    def _socket_callback(
+        self, ev_bitmask: int, sock_fd: int, multi_handle, data
+    ) -> None:
+        log.debug(
+            "socket_callback: fd=%d ev=%s",
+            sock_fd,
+            self._socket_bitmask_decode(ev_bitmask),
+        )
+
+        async def socket_task():
+            if ev_bitmask & pycurl.POLL_REMOVE:
+                self._sockets.pop(sock_fd, None)
+            else:
+                # is this correct, we won't clear a POLL_IN or POLL_OUT...
+                self._sockets[sock_fd] = ev_bitmask
+                if ev_bitmask == pycurl.POLL_IN:
+                    await anyio.wait_readable(sock_fd)
+                elif ev_bitmask == pycurl.POLL_OUT:
+                    await anyio.wait_writable(sock_fd)
+                elif ev_bitmask == pycurl.POLL_INOUT:
+                    raise NotImplementedError("INOUT")
+                # could choose to _drain_messages() when this changes, else drain each time
+                running = self._curl_multi.socket_action(sock_fd, ev_bitmask)
+                log.debug("%s xfers", running)  # is (0, number_of_handles)
+                self._post_curl()
+
+        self._callback_tasks.append(socket_task)
+
+    # Note transport's __aenter__ is also awaited when "with AsyncClient() as
+    # client" is called (but it isn't when client is used without with
+    # statement)
+
+    _timer_callbacks = 0
+
+    def _timer_callback(self, timeout_ms: int) -> None:
+        log.debug("timer_callback: timeout=%d", timeout_ms)
+        self._timer_callbacks += 1
+        if self._timer_callbacks > 100:  # XXX TODO
+            log.debug("No more timers allowed")
+            return
+        self._callback_tasks.append(lambda: self._do_timer(timeout_ms))
+
+    async def _do_timer(self, timeout_ms: int) -> None:
+        # will we always be in just one thread?
+        await anyio.sleep(timeout_ms / 1000.0)
+        log.debug("Timed out! %d", timeout_ms)
+        running = self._curl_multi.socket_action(pycurl.SOCKET_TIMEOUT, 0)
+        log.debug("%s xfers", running)
+        self._post_curl()
+
+    def _post_curl(self):
+        """
+        Call after any curl call to schedule callback responses.
+        """
+        for callback in self._callback_tasks:
+            self._tg.start_soon(callback)
+        self._callback_tasks.clear()
+        self._drain_messages(self._curl_multi)
+
+    def _drain_messages(self, multi: pycurl.CurlMulti):
+        while True:
+            queued, successful, failed = multi.info_read()
+
+            for curl in successful:
+                self._complete_success(multi, curl)
+            for curl, code, message in failed:
+                self._complete_error(multi, curl, code, message)
+
+            if queued == 0:
+                break
+
+    def _complete_success(self, multi: pycurl.CurlMulti, curl: pycurl.Curl):
+        # may be able to return Response() while data is streaming out in async land
+        curl.event.set()
+
+    def _complete_error(
+        self,
+        multi: pycurl.CurlMulti,
+        curl: pycurl.Curl,
+        code: int,
+        message: str,
+    ):
+        # will the curl object tell us its fail message or must we save it here?
+        curl.event.set()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._closed:
+            raise httpx.TransportError("transport is closed")
+
+        context = _TransferContext(
+            response_body=SpooledTemporaryFile(max_size=1024 * 1024)
+        )
+
+        curl = _pycurl.Curl()
+        try:
+            _configure_curl(
+                curl,
+                request,
+                context,
+                timeout=self._timeout,
+                verify=self._verify,
+                follow_redirects=self._follow_redirects,
+                user_agent=self._user_agent,
+                verbose=self._verbose,
+                debug_callback=self._debug_callback,
+                debug_logger=self._debug_logger,
+            )
+            curl.event = anyio.Event()
+            self._curl_multi.add_handle(curl)
+            self._post_curl()
+
+            await curl.event.wait()
+
+            curl_response = _finalize_curl_response(curl, context)
+            response = httpx.Response(
+                status_code=curl_response.status_code,
+                headers=curl_response.headers,
+                stream=_SyncFileStream(curl_response.body_file),
+                request=request,
+                extensions={"http_version": curl_response.http_version},
+            )
+            return response
+
+        except Exception as error:
+            context.response_body.close()
+            curl.close()
+            log.debug("%s", error)
+            return
+
+    async def aclose(self):
+        if self._closed:
+            return
+        self._closed = True
+
+
+# XXX might want to call pycurl.global_init() manually

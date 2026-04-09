@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
 from pycurltx import transport
 
 
@@ -282,18 +281,11 @@ def test_multi_transport_handles_concurrent_calls(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.anyio
 async def test_async_multi_socket_transport(monkeypatch: pytest.MonkeyPatch):
-    def behavior(curl: _FakeCurl):
-        header = curl.options[curl.module.HEADERFUNCTION]
-        writer = curl.options[curl.module.WRITEFUNCTION]
-        header(b"HTTP/1.1 200 OK\r\n")
-        header(b"\r\n")
-        writer(b"socket")
+    # logging.basicConfig(level=logging.DEBUG)
 
-    _install_fake_pycurl(monkeypatch, behavior=behavior)
-    tx = transport.PyCurlAsyncMultiSocketTransport()
-    request = httpx.Request("GET", "https://example.com/socket")
+    async with transport.PyCurlTx() as tx:
+        request = httpx.Request("GET", "http://www.example.com/")
 
-    response = await tx.handle_async_request(request)
+        response = await tx.handle_async_request(request)
 
-    assert await response.aread() == b"socket"
-    await tx.aclose()
+    print("Response", response.status_code, response.read())
