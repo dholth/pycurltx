@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -41,3 +43,21 @@ async def test_fetch_nginx(ca_cert, server):
     ) as client:
         response = await client.get(server)
         assert "Welcome" in (await response.aread()).decode("utf-8")
+
+
+@pytest.mark.anyio
+async def test_fetch_nginx_parallel_data(ca_cert, server):
+    async with httpx.AsyncClient(
+        transport=transport.PyCurlTx(cainfo=ca_cert)
+    ) as client:
+        paths = ["/data/small", "/data/medium", "/data/large"]
+        urls = [
+            f"{server.removesuffix('/')}{path}" for path in paths for _ in range(20)
+        ]
+
+        responses = await asyncio.gather(*(client.get(url) for url in urls))
+
+    assert all(response.status_code == 200 for response in responses)
+
+    for response in responses:
+        await response.aread()

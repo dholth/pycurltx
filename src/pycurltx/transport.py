@@ -135,7 +135,6 @@ def _configure_curl(
         return len(chunk)
 
     def write_callback(chunk: bytes) -> int:
-        log.debug("body %s", chunk)
         context.response_body.write(chunk)
         return len(chunk)
 
@@ -151,8 +150,6 @@ def _configure_curl(
     curl.setopt(_pycurl.SSL_VERIFYHOST, 2 if verify else 0)
 
     # cost incurred when TLS connection is made
-    if cainfo is None:
-        cainfo = certifi.where()
     curl.setopt(_pycurl.CAINFO, cainfo)
 
     # How to tell when available?
@@ -254,7 +251,7 @@ class PyCurlTx(httpx.AsyncBaseTransport):
         self._debug_logger = debug_logger
         self._max_connections = max_connections
         self._closed = False
-        self._cainfo = cainfo
+        self._cainfo = cainfo or certifi.where()
 
         # anyio
         # _tg holds task driving CurlMulti()
@@ -357,6 +354,8 @@ class PyCurlTx(httpx.AsyncBaseTransport):
     def _drain_messages(self, multi: pycurl.CurlMulti):
         while True:
             queued, successful, failed = multi.info_read()
+
+            log.debug("s:%s f:%s", successful, failed)
 
             for curl in successful:
                 self._complete_success(multi, curl)

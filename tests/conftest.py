@@ -42,13 +42,21 @@ def server(tmp_path_factory, server_cert, xprocess):
     Start test http/2 web server with certs, return URL.
     """
     tmp_path = tmp_path_factory.mktemp("web")
+
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+
+    (data_path / "small").write_bytes(b"0" * 1024)
+    (data_path / "medium").write_bytes(b"0" * (16 * 1024))
+    (data_path / "large").write_bytes(b"0" * (1024 * 1024))
+
     assert Path(server_cert).exists()
 
     conf = (
         (HERE / "nginx" / "nginx.conf")
         .read_text()
         .replace("localhost.pem", str(server_cert))
-        .replace("TEST_DATA", str(tmp_path))
+        .replace("TEST_DATA", str(data_path))
     )
     edited = tmp_path / "nginx.conf"
     edited.write_text(conf)

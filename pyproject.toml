@@ -12,7 +12,7 @@ dependencies = ["anyio>=4.4", "httpx>=0.27", "pycurl>=7.45"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2"]
-test = ["trio", "pytest-xprocess"]
+test = ["trio", "pytest-xprocess", "trustme"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pycurltx"]
