@@ -351,6 +351,7 @@ class PyCurlTx(httpx.AsyncBaseTransport):
         for callback in self._callback_tasks:
             self._tg.start_soon(callback)
         self._callback_tasks.clear()
+        # may belong inside the callback or after the callbacks run
         self._drain_messages(self._curl_multi)
 
     def _drain_messages(self, multi: pycurl.CurlMulti):
