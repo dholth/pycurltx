@@ -1,9 +1,9 @@
 import socket
+import ssl
 from pathlib import Path
 
 import pytest
 import trustme
-import ssl
 from xprocess import ProcessStarter
 
 HERE = Path(__file__).parent

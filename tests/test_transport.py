@@ -68,5 +68,7 @@ async def test_fetch_nginx_parallel_data(ca_cert, server, regular, ssl_context):
     print(f"{client._transport} took {(end - begin) / 1e9:0.03f}s")
 
     for response in responses:
-        await response.aread()
-        # print(response.url, body[:16], len(body))
+        body = await response.aread()
+        expected = ord(b"0")
+        assert all((b == expected) for b in body)
+        assert len(body) in (1024, 16 * 1024, 1024 * 1024)
