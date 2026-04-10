@@ -9,6 +9,7 @@ from threading import Condition, Event, Thread
 from typing import TYPE_CHECKING
 
 import anyio
+import certifi
 import httpx
 
 try:
@@ -101,9 +102,10 @@ class _AsyncFileStream(httpx.AsyncByteStream):
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         while True:
-            chunk = await anyio.to_thread.run_sync(
-                self._body_file.read, self._chunk_size
-            )
+            chunk = self._body_file.read(self._chunk_size)
+            # XXX needs revision to be properly async+streaming, but
+            # async+"doesn't return response until all buffered" is also a
+            # useful mode.
             if not chunk:
                 break
             yield chunk
@@ -134,6 +136,7 @@ def _configure_curl(
     verbose: bool,
     debug_callback: Callable[[int, bytes], None] | None,
     debug_logger: logging.Logger | None,
+    cainfo: str | None,
 ):
     _pycurl = _require_pycurl()
 
@@ -161,6 +164,8 @@ def _configure_curl(
     curl.setopt(_pycurl.FOLLOWLOCATION, 1 if follow_redirects else 0)
     curl.setopt(_pycurl.SSL_VERIFYPEER, 1 if verify else 0)
     curl.setopt(_pycurl.SSL_VERIFYHOST, 2 if verify else 0)
+    # cost incurred when TLS connection is made
+    curl.setopt(_pycurl.CAINFO, cainfo)
     if timeout is not None:
         curl.setopt(_pycurl.TIMEOUT_MS, int(timeout * 1000))
     if user_agent:
@@ -520,7 +525,7 @@ class PyCurlAsyncTransport(httpx.AsyncBaseTransport):
         self._sync_transport.close()
 
 
-class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
+class PyCurlTx(httpx.AsyncBaseTransport):
     def __init__(
         self,
         timeout: float | None = None,
@@ -531,6 +536,7 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
         debug_callback: Callable[[int, bytes], None] | None = None,
         debug_logger: logging.Logger | None = None,
         max_connections: int = 100,
+        cainfo: str | None = None,
     ):
         self._timeout = timeout
         self._verify = verify
@@ -550,6 +556,8 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
             pycurl.Curl,
             tuple[httpx.Request, _TransferContext, asyncio.Future[_CurlResponse]],
         ] = {}
+
+        self._cainfo = cainfo or certifi.where()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if self._closed:
@@ -584,6 +592,7 @@ class PyCurlAsyncMultiSocketTransport(httpx.AsyncBaseTransport):
                 verbose=self._verbose,
                 debug_callback=self._debug_callback,
                 debug_logger=self._debug_logger,
+                cainfo=self._cainfo,
             )
             self._transfers[curl] = (request, context, future)
             multi.add_handle(curl)

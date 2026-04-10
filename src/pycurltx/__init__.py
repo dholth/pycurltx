@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from .transport import (
-    PyCurlAsyncMultiSocketTransport,
     PyCurlAsyncTransport,
     PyCurlMultiTransport,
     PyCurlTransport,
+    PyCurlTx,
 )
 
 __all__ = [
@@ -12,4 +12,5 @@ __all__ = [
     "PyCurlAsyncTransport",
     "PyCurlMultiTransport",
     "PyCurlAsyncMultiSocketTransport",
+    "PyCurlTx",
 ]
