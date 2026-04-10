@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import anyio
 import certifi
 import httpx
+import io
 import pycurl
 import pycurl as _pycurl
 
@@ -85,9 +86,8 @@ class _AsyncFileStream(httpx.AsyncByteStream):
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         while True:
-            chunk = await anyio.to_thread.run_sync(
-                self._body_file.read, self._chunk_size
-            )
+            # we don't return the "async" response until curl is done
+            chunk = self._body_file.read(self._chunk_size)
             if not chunk:
                 break
             yield chunk
@@ -302,27 +302,30 @@ class PyCurlTx(httpx.AsyncBaseTransport):
         self, ev_bitmask: int, sock_fd: int, multi_handle, data
     ) -> None:
         log.debug(
-            "socket_callback: fd=%d ev=%s",
+            "socket_callback: fd=%d",
             sock_fd,
-            self._socket_bitmask_decode(ev_bitmask),
+            # self._socket_bitmask_decode(ev_bitmask),
         )
 
         async def socket_task():
             if ev_bitmask & pycurl.POLL_REMOVE:
                 self._sockets.pop(sock_fd, None)
             else:
-                # is this correct, we won't clear a POLL_IN or POLL_OUT...
-                self._sockets[sock_fd] = ev_bitmask
-                if ev_bitmask == pycurl.POLL_IN:
-                    await anyio.wait_readable(sock_fd)
-                elif ev_bitmask == pycurl.POLL_OUT:
-                    await anyio.wait_writable(sock_fd)
-                elif ev_bitmask == pycurl.POLL_INOUT:
-                    raise NotImplementedError("INOUT")
-                # could choose to _drain_messages() when this changes, else drain each time
-                running = self._curl_multi.socket_action(sock_fd, ev_bitmask)
-                log.debug("%s xfers", running)  # is (0, number_of_handles)
-                self._post_curl()
+                try:
+                    # is this correct, we won't clear a POLL_IN or POLL_OUT...
+                    self._sockets[sock_fd] = ev_bitmask
+                    if ev_bitmask == pycurl.POLL_IN:
+                        await anyio.wait_readable(sock_fd)
+                    elif ev_bitmask == pycurl.POLL_OUT:
+                        await anyio.wait_writable(sock_fd)
+                    elif ev_bitmask == pycurl.POLL_INOUT:
+                        raise NotImplementedError("INOUT")
+                    # could choose to _drain_messages() when this changes, else drain each time
+                    running = self._curl_multi.socket_action(sock_fd, ev_bitmask)
+                    log.debug("%s xfers", running)  # is (0, number_of_handles)
+                    self._post_curl()
+                except OSError:
+                    log.warning("Bad file selector %d", sock_fd)
 
         self._callback_tasks.append(socket_task)
 
@@ -404,7 +407,8 @@ class PyCurlTx(httpx.AsyncBaseTransport):
             raise httpx.TransportError("transport is closed")
 
         context = _TransferContext(
-            response_body=SpooledTemporaryFile(max_size=1024 * 1024)
+            # response_body=SpooledTemporaryFile(max_size=1024 * 1024)
+            response_body=io.BytesIO()
         )
 
         curl = _pycurl.Curl()
@@ -452,8 +456,9 @@ class PyCurlTx(httpx.AsyncBaseTransport):
             raise
 
         finally:
-            # self._curl_multi.remove_handle(curl)
-            # curl.close()  # for streaming responses, can't happen here
+            self._curl_multi.remove_handle(curl)
+            self._post_curl()
+            curl.close()  # for streaming responses, can't happen here
             self._post_curl()
 
     async def aclose(self):
