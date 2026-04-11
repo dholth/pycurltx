@@ -92,6 +92,21 @@ class _RequestBodyReader:
         self._buffer = self._buffer[size:]
         return data
 
+    # TODO: Implement CURL_READFUNC_PAUSE strategy for streaming async request bodies
+    # Currently, async streams are pre-consumed into memory before being passed to curl's
+    # synchronous READFUNCTION callback. This works but has memory implications for large
+    # request bodies. A better approach would be to:
+    #
+    # 1. Return CURL_READFUNC_PAUSE from read() when the buffer is empty and more data
+    #    needs to be fetched from the async stream
+    # 2. Store reference to event loop and curl handle in _RequestBodyReader
+    # 3. Register async task to fetch next chunk from stream when PAUSE is returned
+    # 4. Call curl.pause(pycurl.PAUSE_RECV | pycurl.PAUSE_SEND) to pause transfer
+    # 5. Resume transfer with curl.pause(0) once next chunk is available
+    #
+    # This would allow truly streaming async request bodies without buffering everything
+    # in memory first, while maintaining pycurl's synchronous callback interface.
+
 
 class _FileStream(httpx.SyncByteStream, httpx.AsyncByteStream):
     """Unified file-based stream supporting both sync and async iteration."""
