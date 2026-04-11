@@ -97,8 +97,10 @@ class SlowHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == "/delay":
-                # Sleep for 60 seconds before responding
-                time.sleep(60)
+                # Sleep in small increments so we can be interrupted quickly
+                # Total delay of 60 seconds, but in 0.1s chunks
+                for _ in range(600):
+                    time.sleep(0.1)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
