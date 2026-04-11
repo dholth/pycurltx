@@ -31,7 +31,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          conda install conda-pypi editables pytest nginx pytest-asyncio pytest-xprocess trustme httpx pycurl h2 chardet zstandard brotli socksio trio uvicorn cryptography
+          conda install conda-pypi editables pytest nginx pytest-asyncio pytest-xprocess trustme httpx pycurl h2 chardet zstandard brotli trio uvicorn cryptography
+          conda pypi install --ignore-channels socksio
           conda pypi install -e pycurltx/
 
       - name: Apply httpx patch
