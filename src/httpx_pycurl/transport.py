@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from typing import BinaryIO, Callable
 
 
+# Sentinel object for signaling end of stream
+_END_OF_STREAM = object()
+
+
 @dataclass
 class _CurlResponse:
     status_code: int
@@ -103,6 +107,57 @@ class _AsyncFileStream(httpx.AsyncByteStream):
         await anyio.to_thread.run_sync(self._body_file.close)
 
 
+class _AsyncQueueStream(httpx.AsyncByteStream):
+    """Async byte stream that collects write_callback values from a queue.
+
+    Pycurl callbacks are executed synchronously within the event loop,
+    so we can put chunks directly into the queue without call_soon_threadsafe.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+        self._loop = loop
+
+    def write_callback(self, chunk: bytes) -> int:
+        """Callback to be used by pycurl to add chunks to the queue.
+
+        Called synchronously during socket event handling in the event loop,
+        so put_nowait is safe without call_soon_threadsafe.
+        """
+        try:
+            self._queue.put_nowait(chunk)
+        except asyncio.QueueFull:
+            # Queue is full, this shouldn't happen with asyncio.Queue
+            pass
+        return len(chunk)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(self._queue.get(), timeout=30.0)
+                if chunk is _END_OF_STREAM:
+                    break
+                if isinstance(chunk, bytes):
+                    yield chunk
+            except asyncio.TimeoutError:
+                # Timeout waiting for next chunk
+                break
+
+    async def aclose(self):
+        """Close the stream and signal end of stream."""
+        try:
+            self._queue.put_nowait(_END_OF_STREAM)
+        except (RuntimeError, asyncio.QueueFull):
+            pass
+
+    def signal_end_of_stream(self):
+        """Signal end of stream - called from event loop context."""
+        try:
+            self._queue.put_nowait(_END_OF_STREAM)
+        except asyncio.QueueFull:
+            pass
+
+
 def _parse_status_line(status_line: bytes | None) -> tuple[str, bytes]:
     if not status_line:
         return "", b""
@@ -153,6 +208,7 @@ def _configure_curl(
     debug_callback: Callable[[int, bytes], None] | None,
     debug_logger: logging.Logger | None,
     cainfo: str | None,
+    async_stream: _AsyncQueueStream | None = None,
 ):
     def header_callback(chunk: bytes) -> int:
         line = chunk.rstrip(b"\r\n")
@@ -168,8 +224,13 @@ def _configure_curl(
         return len(chunk)
 
     def write_callback(chunk: bytes) -> int:
-        context.response_body.write(chunk)
-        return len(chunk)
+        if async_stream is not None:
+            # Use async stream for streaming response bodies
+            return async_stream.write_callback(chunk)
+        else:
+            # Fall back to file-based buffering
+            context.response_body.write(chunk)
+            return len(chunk)
 
     curl.setopt(_pycurl.URL, str(request.url))
     curl.setopt(_pycurl.WRITEFUNCTION, write_callback)
@@ -345,7 +406,12 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         self._socket_watch: dict[int, int] = {}
         self._transfers: dict[
             pycurl.Curl,
-            tuple[httpx.Request, _TransferContext, asyncio.Future[_CurlResponse]],
+            tuple[
+                httpx.Request,
+                _TransferContext,
+                asyncio.Future[_CurlResponse],
+                _AsyncQueueStream | None,
+            ],
         ] = {}
 
         self._cainfo = cainfo or certifi.where()
@@ -377,6 +443,9 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         curl = _pycurl.Curl()
         future: asyncio.Future[_CurlResponse] = loop.create_future()
 
+        # Create async queue stream for streaming response bodies
+        async_stream = _AsyncQueueStream(loop)
+
         try:
             _configure_curl(
                 curl,
@@ -390,8 +459,9 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
                 debug_callback=self._debug_callback,
                 debug_logger=self._debug_logger,
                 cainfo=self._cainfo,
+                async_stream=async_stream,
             )
-            self._transfers[curl] = (request, context, future)
+            self._transfers[curl] = (request, context, future, async_stream)
             multi.add_handle(curl)
             self._drive_socket(_pycurl.SOCKET_TIMEOUT, 0)
 
@@ -399,7 +469,7 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             return httpx.Response(
                 status_code=curl_response.status_code,
                 headers=curl_response.headers,
-                stream=_AsyncFileStream(curl_response.body_file),
+                stream=async_stream,
                 request=request,
                 extensions={"http_version": curl_response.http_version},
             )
@@ -432,7 +502,9 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         if multi is None:
             return
 
-        for curl, (_request, context, future) in list(self._transfers.items()):
+        for curl, (_request, context, future, async_stream) in list(
+            self._transfers.items()
+        ):
             if not future.done():
                 future.set_exception(
                     httpx.TransportError("transport closed before request completed")
@@ -566,10 +638,15 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         transfer = self._transfers.pop(curl, None)
         if transfer is None:
             return
-        _request, context, future = transfer
+        _request, context, future, async_stream = transfer
 
         try:
             response = _finalize_curl_response(curl, context)
+            # Signal end of stream if using async streaming
+            if async_stream is not None:
+                async_stream.signal_end_of_stream()
+                # Close the context file since we're streaming from queue instead
+                context.response_body.close()
             if not future.done():
                 future.set_result(response)
         except Exception as error:
@@ -583,7 +660,7 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         transfer = self._transfers.pop(curl, None)
         if transfer is None:
             return
-        _request, context, future = transfer
+        _request, context, future, async_stream = transfer
         context.response_body.close()
         if not future.done():
             future.set_exception(_map_pycurl_error(code, message))
