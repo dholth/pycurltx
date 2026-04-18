@@ -32,7 +32,9 @@ niquests: 0.655s
 ```bash
 pip install httpx-pycurl
 ```
+
 Or with conda,
+
 ```bash
 conda install -n base conda-pypi
 conda pypi install httpx-pycurl
