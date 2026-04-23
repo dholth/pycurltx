@@ -1,6 +1,8 @@
---- httpx/tests/conftest.py	2026-04-11 14:01:04.396153925 -0400
-+++ httpx/tests/conftest.py	2026-04-11 13:57:52.634747616 -0400
-@@ -285,3 +285,127 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 858bca1..b5d70c0 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -285,3 +285,84 @@ def server() -> typing.Iterator[TestServer]:
      config = Config(app=app, lifespan="off", loop="asyncio")
      server = TestServer(config=config)
      yield from serve_in_thread(server)
