@@ -95,6 +95,7 @@ class SlowHandler(BaseHTTPRequestHandler):
     """HTTP handler that delays response."""
 
     shutdown_flag = False
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self):
         try:
@@ -109,11 +110,20 @@ class SlowHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"Delayed response after 60 seconds\n")
-            else:
+            elif self.path == "/short":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", 100)
                 self.end_headers()
-                self.wfile.write(b"OK\n")
+                self.wfile.write(b"short response\n")
+                self.wfile.close()
+            else:
+                body = b"OK\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client disconnected, ignore
 
