@@ -33,19 +33,34 @@ class AsyncCurl:
         """Initialize AsyncCurl.
 
         Args:
-            loop: Optional event loop. If None, detected from get_running_loop()
-                  on first perform() call.
+            loop: Optional event loop. If None, detected from get_running_loop().
+                  AsyncCurl is one-time-use and initializes multi/loop eagerly.
+
+        Raises:
+            RuntimeError: If no event loop is available and none provided.
         """
+        # Get loop eagerly
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                raise RuntimeError(
+                    "AsyncCurl requires asyncio event loop; call from async context or "
+                    "pass loop to __init__"
+                )
         self._loop = loop
-        self._multi: pycurl.CurlMulti | None = None
         self._closed = False
+
+        # Create multi handle immediately
+        self._multi = pycurl.CurlMulti()
+        self._multi.setopt(pycurl.M_SOCKETFUNCTION, self._socket_callback)
+        self._multi.setopt(pycurl.M_TIMERFUNCTION, self._timer_callback)
 
         # Track in-flight transfers: curl handle -> Future
         self._transfers: dict[pycurl.Curl, asyncio.Future] = {}
 
         # Socket management
         self._socket_watch: dict[int, int] = {}
-        self._socket_callbacks_registered = False
 
         # Timer management
         self._timer_handle: asyncio.TimerHandle | None = None
@@ -65,17 +80,13 @@ class AsyncCurl:
         if self._closed:
             raise RuntimeError("AsyncCurl is closed")
 
-        # Lazy loop detection
-        loop = self._ensure_loop()
-
         # Create future for this transfer
-        future: asyncio.Future[None] = loop.create_future()
+        future: asyncio.Future[None] = self._loop.create_future()
         self._transfers[curl] = future
 
         try:
             # Add to multi handle
-            multi = self._ensure_multi()
-            multi.add_handle(curl)
+            self._multi.add_handle(curl)
 
             # Trigger initial processing
             self._drive_socket(pycurl.SOCKET_TIMEOUT, 0)
@@ -95,9 +106,7 @@ class AsyncCurl:
     async def aclose(self) -> None:
         """Close and clean up resources.
 
-        Can be called multiple times safely. After close, perform() will
-        raise RuntimeError on new calls, but the object can be reused if
-        _multi is recreated.
+        Can be called multiple times safely.
         """
         self._closed = True
         self._cancel_timer()
@@ -112,35 +121,36 @@ class AsyncCurl:
                 logger.exception("Error closing CurlMulti: %s", e)
             self._multi = None
 
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or detect the event loop."""
-        if self._loop is not None:
-            return self._loop
+    async def __aenter__(self) -> AsyncCurl:
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit."""
+        await self.aclose()
+
+    def _register_socket(self, fd: int, what: int) -> None:
+        """Register socket with event loop based on event mask."""
+        # Clean up previous registration
+        self._loop.remove_reader(fd)
+        self._loop.remove_writer(fd)
+
+        if what == pycurl.POLL_REMOVE:
+            self._socket_watch.pop(fd, None)
+            return
+
+        self._socket_watch[fd] = what
 
         try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            raise RuntimeError(
-                "AsyncCurl requires asyncio event loop; call from async context or "
-                "pass loop to __init__"
-            )
-
-        return self._loop
-
-    def _ensure_multi(self) -> pycurl.CurlMulti:
-        """Get or create the CurlMulti handle."""
-        if self._multi is not None:
-            return self._multi
-
-        self._ensure_loop()
-        multi = pycurl.CurlMulti()
-
-        # Register callbacks
-        multi.setopt(pycurl.M_SOCKETFUNCTION, self._socket_callback)
-        multi.setopt(pycurl.M_TIMERFUNCTION, self._timer_callback)
-
-        self._multi = multi
-        return multi
+            if what in {pycurl.POLL_IN, pycurl.POLL_INOUT}:
+                self._loop.add_reader(fd, self._on_socket_readable, fd)
+            if what in {pycurl.POLL_OUT, pycurl.POLL_INOUT}:
+                self._loop.add_writer(fd, self._on_socket_writable, fd)
+        except OSError as e:
+            logger.warning("Failed to register socket %d: %s", fd, e)
+            self._socket_watch.pop(fd, None)
+            self._loop.remove_reader(fd)
+            self._loop.remove_writer(fd)
 
     def _socket_callback(
         self, what: int, fd: int, multi: pycurl.CurlMulti, socketp: object
@@ -154,36 +164,8 @@ class AsyncCurl:
         self._schedule_timeout(timeout_ms)
         return 0
 
-    def _register_socket(self, fd: int, what: int) -> None:
-        """Register socket with event loop based on event mask."""
-        loop = self._ensure_loop()
-
-        # Clean up previous registration
-        loop.remove_reader(fd)
-        loop.remove_writer(fd)
-
-        if what == pycurl.POLL_REMOVE:
-            self._socket_watch.pop(fd, None)
-            return
-
-        self._socket_watch[fd] = what
-
-        try:
-            if what in {pycurl.POLL_IN, pycurl.POLL_INOUT}:
-                loop.add_reader(fd, self._on_socket_readable, fd)
-            if what in {pycurl.POLL_OUT, pycurl.POLL_INOUT}:
-                loop.add_writer(fd, self._on_socket_writable, fd)
-        except OSError as e:
-            logger.warning("Failed to register socket %d: %s", fd, e)
-            self._socket_watch.pop(fd, None)
-            loop.remove_reader(fd)
-            loop.remove_writer(fd)
-
     def _cleanup_sockets(self) -> None:
         """Unregister all sockets from event loop."""
-        if self._loop is None:
-            return
-
         for fd in list(self._socket_watch):
             try:
                 self._loop.remove_reader(fd)
@@ -200,12 +182,12 @@ class AsyncCurl:
         if timeout_ms < 0:
             return
 
-        loop = self._ensure_loop()
-
         if timeout_ms == 0:
-            loop.call_soon(self._on_timeout)
+            self._loop.call_soon(self._on_timeout)
         else:
-            self._timer_handle = loop.call_later(timeout_ms / 1000.0, self._on_timeout)
+            self._timer_handle = self._loop.call_later(
+                timeout_ms / 1000.0, self._on_timeout
+            )
 
     def _cancel_timer(self) -> None:
         """Cancel any pending timer."""
@@ -228,11 +210,9 @@ class AsyncCurl:
 
     def _drive_socket(self, sock_fd: int, event_mask: int) -> None:
         """Process socket activity in the multi handle."""
-        multi = self._ensure_multi()
-
         # Call socket_action until no more immediate work
         while True:
-            status, _running = multi.socket_action(sock_fd, event_mask)
+            status, _running = self._multi.socket_action(sock_fd, event_mask)
             if status != pycurl.E_CALL_MULTI_PERFORM:
                 break
 
@@ -241,10 +221,8 @@ class AsyncCurl:
 
     def _drain_info_read(self) -> None:
         """Process completed and failed transfers from multi handle."""
-        multi = self._ensure_multi()
-
         while True:
-            queued, successful, failed = multi.info_read()
+            queued, successful, failed = self._multi.info_read()
 
             for curl in successful:
                 self._complete_transfer(curl, None, None)
@@ -275,7 +253,6 @@ class AsyncCurl:
 
         # Remove from multi handle
         try:
-            multi = self._ensure_multi()
-            multi.remove_handle(curl)
+            self._multi.remove_handle(curl)
         except Exception as e:
             logger.warning("Error removing handle from multi: %s", e)
