@@ -85,11 +85,16 @@ class AsyncCurl:
         self._transfers[curl] = future
 
         try:
+            # Track if this is the first handle
+            first_handle = len(self._transfers) == 1
+
             # Add to multi handle
             self._multi.add_handle(curl)
 
-            # Trigger initial processing
-            self._drive_socket(pycurl.SOCKET_TIMEOUT, 0)
+            # Only trigger initial processing for the first handle
+            # Subsequent handles will be driven by socket/timer callbacks
+            if first_handle:
+                self._drive_socket(pycurl.SOCKET_TIMEOUT, 0)
 
             # Wait for completion
             await future

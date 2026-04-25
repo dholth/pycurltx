@@ -489,7 +489,7 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         self._cainfo = cainfo or certifi.where()
         self._stream_response = stream_response
 
-        self._curl = AsyncCurl()
+        self._curl: AsyncCurl | None = None
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -514,6 +514,10 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             raise httpx.TransportError(
                 "AsyncPyCurlTransport must be used from one event loop"
             )
+
+        # Lazily initialize AsyncCurl on first request
+        if self._curl is None:
+            self._curl = AsyncCurl(loop)
 
         context = _TransferContext(
             response_body=SpooledTemporaryFile(max_size=1024 * 1024)
