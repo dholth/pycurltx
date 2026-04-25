@@ -95,6 +95,7 @@ class SlowHandler(BaseHTTPRequestHandler):
     """HTTP handler that delays response."""
 
     shutdown_flag = False
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self):
         try:
@@ -109,11 +110,22 @@ class SlowHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"Delayed response after 60 seconds\n")
-            else:
+            elif self.path == "/short":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", 100)
                 self.end_headers()
-                self.wfile.write(b"OK\n")
+                self.wfile.write(b"short response\n")
+                self.wfile.flush()
+                # time.sleep(0.1)  # help with race condition getting content vs error?
+                raise TimeoutError("early close from server")
+            else:
+                body = b"OK\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client disconnected, ignore
 
@@ -121,8 +133,7 @@ class SlowHandler(BaseHTTPRequestHandler):
         pass  # Suppress logging
 
 
-@pytest.fixture(scope="session")
-def slow_server():
+def py_server():
     """Start a simple HTTP server that delays responses."""
     server = HTTPServer(("127.0.0.1", 0), SlowHandler)
     host, port = server.server_address
@@ -138,3 +149,17 @@ def slow_server():
     SlowHandler.shutdown_flag = True
     server.shutdown()
     thread.join(timeout=5.0)
+
+
+@pytest.fixture(scope="session")
+def slow_server():
+    yield from py_server()
+
+
+@pytest.fixture()
+def short_server():
+    """
+    'short response' behavior seems to break with session-scoped
+    slow_server(), so here's a function-scoped version.
+    """
+    yield from py_server()
