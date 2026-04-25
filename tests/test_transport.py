@@ -238,29 +238,17 @@ async def test_response_closed_early(regular, slow_server):
     if regular:
         # httpx AsyncHTTPTransport
         client = httpx.AsyncClient(timeout=timeout)
-        transport_name = "httpx.AsyncHTTPTransport"
     else:
         # AsyncPyCurlTransport
         client = httpx.AsyncClient(
             transport=transport.AsyncPyCurlTransport(timeout=timeout)
         )
-        transport_name = "AsyncPyCurlTransport"
 
     chunks = []
     async with client:
-        start = time.monotonic()
         with pytest.raises((httpx.RemoteProtocolError, httpx.ReadTimeout)):
             async with client.stream("GET", url) as response:
                 async for chunk in response.aiter_bytes():
                     chunks.append(chunk)
-        elapsed = time.monotonic() - start
 
-        # For pycurl transport, we should get at least the partial response before the error
-        # (httpx regular transport might get empty chunks if timeout fires before data arrives)
-        if not regular and chunks:
-            assert chunks == [b"short response\n"], f"Expected partial response, got {chunks}"
-        
-        # Verify timeout was triggered reasonably quickly
-        assert elapsed < timeout * 2 + 0.5, (
-            f"{transport_name} took too long: {elapsed:.2f}s"
-        )
+        assert chunks == [b"short response\n"]

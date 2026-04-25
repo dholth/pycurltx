@@ -594,7 +594,11 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             # If perform() failed but we got a response (partial data received),
             # we should still return the response and let the stream signal the error
             if perform_error is not None:
-                if async_stream is None or curl_response is None or curl_response.status_code == 0:
+                if (
+                    async_stream is None
+                    or curl_response is None
+                    or curl_response.status_code == 0
+                ):
                     # For non-streaming, no response, or error before response started: raise immediately
                     curl.close()
                     raise perform_error
