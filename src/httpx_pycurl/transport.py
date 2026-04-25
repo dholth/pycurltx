@@ -183,6 +183,9 @@ class _AsyncQueueStream(httpx.AsyncByteStream):
                 chunk = await asyncio.wait_for(self._queue.get(), timeout=30.0)
                 if chunk is _END_OF_STREAM:
                     break
+                if isinstance(chunk, Exception):
+                    # Error was queued, raise it now
+                    raise chunk
                 if isinstance(chunk, bytes):
                     yield chunk
             except asyncio.TimeoutError:
@@ -558,25 +561,46 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             future: asyncio.Future[_CurlResponse] = loop.create_future()
             self._transfers[curl] = _Transfer(request, context, future)
 
+            curl_response = None
+            perform_error = None
+
             try:
                 # Perform the transfer via AsyncCurl
                 await self._curl.perform(curl)
             except pycurl.error as error:
                 code, message = error.args
-                raise _map_pycurl_error(code, str(message), curl) from error
+                # Store the error to signal it later via the stream
+                perform_error = _map_pycurl_error(code, str(message), curl)
             finally:
                 # Finalize response and clean up
                 try:
                     curl_response = _finalize_curl_response(curl, context)
                     # Signal end of stream if using async streaming
                     if async_stream is not None:
+                        if perform_error is not None:
+                            # If transfer failed, queue the error before the sentinel
+                            try:
+                                async_stream._queue.put_nowait(perform_error)
+                            except asyncio.QueueFull:
+                                pass
+                        # Always signal end of stream
                         async_stream.signal_end_of_stream()
                 except Exception:
                     context.response_body.close()
                     raise
                 finally:
                     self._transfers.pop(curl, None)
+
+            # If perform() failed but we got a response (partial data received),
+            # we should still return the response and let the stream signal the error
+            if perform_error is not None:
+                if async_stream is None or curl_response is None or curl_response.status_code == 0:
+                    # For non-streaming, no response, or error before response started: raise immediately
                     curl.close()
+                    raise perform_error
+                # For streaming with status code and partial data: error was already queued, continue
+
+            curl.close()
 
             return httpx.Response(
                 status_code=curl_response.status_code,
