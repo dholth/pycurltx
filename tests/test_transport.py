@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
 import pytest
 
-import httpx
 from httpx_pycurl import transport
 
 
@@ -226,3 +226,40 @@ async def test_timeout_behavior_streaming(regular, slow_server):
             f"{transport_name} took too long: {elapsed:.2f}s"
         )
         print(f"{transport_name} streaming timeout after {elapsed:.2f}s")
+
+
+@pytest.mark.parametrize("regular", [True, False])
+@pytest.mark.asyncio
+async def test_response_closed_early(regular, slow_server):
+    """Test error behavior when server closes before content-length bytes were delivered."""
+    url = f"{slow_server}short"
+    timeout = 0.5  # 500ms timeout
+
+    if regular:
+        # httpx AsyncHTTPTransport
+        client = httpx.AsyncClient(timeout=timeout)
+        transport_name = "httpx.AsyncHTTPTransport"
+    else:
+        # AsyncPyCurlTransport
+        client = httpx.AsyncClient(
+            transport=transport.AsyncPyCurlTransport(timeout=timeout)
+        )
+        transport_name = "AsyncPyCurlTransport"
+
+    got_chunk = False
+    async with client:
+        start = time.monotonic()
+        if True:
+            async with client.stream("GET", url) as response:
+                async for chunk in response.aiter_bytes():
+                    assert chunk == b"short response\n"
+                    print("Got partial response")
+                    got_chunk = True
+        elapsed = time.monotonic() - start
+
+        assert got_chunk, "did not receive partial response body"
+
+        # Verify timeout was triggered reasonably quickly
+        assert elapsed < timeout * 2 + 0.5, (
+            f"{transport_name} took too long: {elapsed:.2f}s"
+        )

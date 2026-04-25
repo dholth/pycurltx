@@ -116,7 +116,8 @@ class SlowHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", 100)
                 self.end_headers()
                 self.wfile.write(b"short response\n")
-                self.wfile.close()
+                # self.wfile.close()  # also triggers error here
+                raise TimeoutError("early close from server")
             else:
                 body = b"OK\n"
                 self.send_response(200)
