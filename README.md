@@ -114,3 +114,18 @@ Paired t-test: httpx_pycurl vs niquests
 t-stat: -8.949 (approx p < 0.05 if |t| > 2.365)
 Speedup: 1.27x
 ```
+
+## Dependencies
+
+`httpx-pycurl` uses curl to support `http/2` instead of the `h2`, `hpack` and
+`hyperframe` dependencies used by `httpx`.
+
+```
+$ pip install --dry-run httpx-pycurl
+...
+Would install anyio-4.13.0 certifi-2026.4.22 h11-0.16.0 httpcore-1.0.9 httpx-0.28.1 httpx-pycurl-0.0.4 idna-3.13 pycurl-7.45.7
+
+$ pip install --dry-run httpx[http2]
+...
+Would install anyio-4.13.0 certifi-2026.4.22 h11-0.16.0 h2-4.3.0 hpack-4.1.0 httpcore-1.0.9 httpx-0.28.1 hyperframe-6.1.0 idna-3.13
+```
