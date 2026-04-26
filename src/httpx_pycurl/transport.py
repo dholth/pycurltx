@@ -576,19 +576,77 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             handle = self._curl.perform(curl)
             self._transfers[curl] = _Transfer(request, context, handle.completion_future)
 
-            # Wait for completion
-            await self._curl.wait_for_completion(handle)
-            
-            # Finalize response
+            # --- Streaming path: return as soon as headers arrive ---
+            if async_stream is not None:
+                # Race the headers-ready event against the raw completion future.
+                # We do NOT wrap the completion future in wait_for_completion here
+                # because cancelling that coroutine would discard the future's result.
+                headers_task = asyncio.ensure_future(context.headers_ready.wait())
+                await asyncio.wait(
+                    [headers_task, handle.completion_future],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Always cancel / clean up the headers_task; it's ephemeral.
+                headers_task.cancel()
+                try:
+                    await headers_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+                if handle.completion_future.done():
+                    # Transfer finished before (or at same time as) headers.
+                    self._transfers.pop(curl, None)
+                    perform_error: httpx.TransportError | None = None
+                    try:
+                        handle.completion_future.result()
+                    except pycurl.error as error:
+                        code, message = error.args
+                        perform_error = _map_pycurl_error(code, str(message), curl)
+                        async_stream._queue.put_nowait(perform_error)
+                    async_stream.signal_end_of_stream()
+
+                    curl_response = _finalize_curl_response(curl, context)
+                    if perform_error is not None and curl_response.status_code == 0:
+                        raise perform_error
+                else:
+                    # Headers ready; transfer still running.
+                    # _finish_streaming takes ownership of the handle.
+                    curl_response = _finalize_curl_response(curl, context)
+                    asyncio.ensure_future(
+                        self._finish_streaming(handle, context, async_stream, curl)
+                    )
+
+                return httpx.Response(
+                    status_code=curl_response.status_code,
+                    headers=curl_response.headers,
+                    stream=curl_response.body_stream or _FileStream(curl_response.body_file),
+                    request=request,
+                    extensions={"http_version": curl_response.http_version},
+                )
+
+            # --- Non-streaming path: buffer everything, then return ---
+            perform_error = None
+            try:
+                await self._curl.wait_for_completion(handle)
+            except pycurl.error as error:
+                code, message = error.args
+                perform_error = _map_pycurl_error(code, str(message), curl)
+            finally:
+                self._transfers.pop(curl, None)
+
             curl_response = _finalize_curl_response(curl, context)
+            if perform_error is not None and curl_response.status_code == 0:
+                raise perform_error
 
             return httpx.Response(
                 status_code=curl_response.status_code,
                 headers=curl_response.headers,
-                stream=curl_response.body_stream or _FileStream(curl_response.body_file),
+                stream=_FileStream(curl_response.body_file),
                 request=request,
                 extensions={"http_version": curl_response.http_version},
             )
+        except httpx.TransportError:
+            raise
         except pycurl.error as error:
             self._transfers.pop(curl, None)
             context.response_body.close()
@@ -598,14 +656,6 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
                 pass
             code, message = error.args
             raise _map_pycurl_error(code, str(message), curl) from error
-        except asyncio.TimeoutError:
-            self._transfers.pop(curl, None)
-            context.response_body.close()
-            try:
-                curl.close()
-            except Exception:
-                pass
-            raise httpx.ConnectTimeout("Transfer timeout")
         except Exception:
             self._transfers.pop(curl, None)
             context.response_body.close()
@@ -614,6 +664,33 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
             except Exception:
                 pass
             raise
+
+    async def _finish_streaming(
+        self,
+        handle: PerformHandle,
+        context: _TransferContext,
+        async_stream: _AsyncQueueStream,
+        curl: pycurl.Curl,
+    ) -> None:
+        """Background coroutine that owns a transfer after early header return.
+
+        Waits for the transfer to finish, then signals end-of-stream so the
+        consumer of async_stream unblocks. Handles errors by queuing them.
+        """
+        try:
+            await self._curl.wait_for_completion(handle)
+        except pycurl.error as error:
+            code, message = error.args
+            perform_error = _map_pycurl_error(code, str(message), curl)
+            async_stream._queue.put_nowait(perform_error)
+        finally:
+            async_stream.signal_end_of_stream()
+            self._transfers.pop(curl, None)
+            context.response_body.close()
+            try:
+                curl.close()
+            except Exception:
+                pass
 
     async def aclose(self):
         if self._closed:
