@@ -11,7 +11,7 @@ import certifi
 import httpx
 import pycurl
 
-from .curl import AsyncCurl
+from .curl import AsyncCurl, PerformHandle
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator
@@ -38,6 +38,8 @@ class _TransferContext:
     status_line: bytes | None = None
     response_headers: list[tuple[bytes, bytes]] = field(default_factory=list)
     async_stream: _AsyncQueueStream | None = None
+    headers_ready: asyncio.Event | None = None
+    headers_complete: bool = False
 
 
 @dataclass
@@ -295,10 +297,16 @@ def _configure_curl(
     def header_callback(chunk: bytes) -> int:
         line = chunk.rstrip(b"\r\n")
         if not line:
+            # Blank line indicates end of headers
+            if context.status_line is not None and not context.headers_complete:
+                context.headers_complete = True
+                if context.headers_ready is not None:
+                    context.headers_ready.set()
             return len(chunk)
         if line.startswith(b"HTTP/"):
             context.status_line = line
             context.response_headers.clear()
+            context.headers_complete = False
             return len(chunk)
         key, sep, value = line.partition(b":")
         if sep:
@@ -524,7 +532,9 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
 
         # Lazily initialize AsyncCurl on first request
         if self._curl is None:
-            self._curl = AsyncCurl(loop, max_connections=self._max_connections)
+            self._curl = AsyncCurl(loop)
+            # since curl 7.30.0 (2013):
+            self._curl.setopt(pycurl.M_MAX_TOTAL_CONNECTIONS, self._max_connections)
 
         context = _TransferContext(
             response_body=SpooledTemporaryFile(max_size=1024 * 1024)
@@ -534,6 +544,11 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
         # Create async queue stream for streaming response bodies if enabled
         async_stream = _AsyncQueueStream(loop) if self._stream_response else None
         context.async_stream = async_stream
+
+        # Create event for signaling when headers are ready
+        # This allows returning response early for streaming
+        if self._stream_response:
+            context.headers_ready = asyncio.Event()
 
         try:
             # Pre-consume async request streams
@@ -557,82 +572,134 @@ class AsyncPyCurlTransport(httpx.AsyncBaseTransport):
                 body_reader=body_reader,
             )
 
-            # Track transfer info
-            future: asyncio.Future[_CurlResponse] = loop.create_future()
-            self._transfers[curl] = _Transfer(request, context, future)
+            # Start transfer (non-blocking, returns immediately)
+            handle = self._curl.perform(curl)
+            self._transfers[curl] = _Transfer(request, context, handle.completion_future)
 
-            curl_response = None
+            # --- Streaming path: return as soon as headers arrive ---
+            if async_stream is not None:
+                # Race the headers-ready event against the raw completion future.
+                # We do NOT wrap the completion future in wait_for_completion here
+                # because cancelling that coroutine would discard the future's result.
+                headers_task = asyncio.ensure_future(context.headers_ready.wait())
+                await asyncio.wait(
+                    [headers_task, handle.completion_future],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Always cancel / clean up the headers_task; it's ephemeral.
+                headers_task.cancel()
+                try:
+                    await headers_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+                if handle.completion_future.done():
+                    # Transfer finished before (or at same time as) headers.
+                    self._transfers.pop(curl, None)
+                    perform_error: httpx.TransportError | None = None
+                    try:
+                        handle.completion_future.result()
+                    except pycurl.error as error:
+                        code, message = error.args
+                        perform_error = _map_pycurl_error(code, str(message), curl)
+                        async_stream._queue.put_nowait(perform_error)
+                    async_stream.signal_end_of_stream()
+
+                    curl_response = _finalize_curl_response(curl, context)
+                    if perform_error is not None and curl_response.status_code == 0:
+                        raise perform_error
+                else:
+                    # Headers ready; transfer still running.
+                    # _finish_streaming takes ownership of the handle.
+                    curl_response = _finalize_curl_response(curl, context)
+                    asyncio.ensure_future(
+                        self._finish_streaming(handle, context, async_stream, curl)
+                    )
+
+                return httpx.Response(
+                    status_code=curl_response.status_code,
+                    headers=curl_response.headers,
+                    stream=curl_response.body_stream or _FileStream(curl_response.body_file),
+                    request=request,
+                    extensions={"http_version": curl_response.http_version},
+                )
+
+            # --- Non-streaming path: buffer everything, then return ---
             perform_error = None
-
             try:
-                # Perform the transfer via AsyncCurl
-                await self._curl.perform(curl)
+                await self._curl.wait_for_completion(handle)
             except pycurl.error as error:
                 code, message = error.args
-                # Store the error to signal it later via the stream
                 perform_error = _map_pycurl_error(code, str(message), curl)
             finally:
-                # Finalize response and clean up
-                try:
-                    curl_response = _finalize_curl_response(curl, context)
-                    # Signal end of stream if using async streaming
-                    if async_stream is not None:
-                        if perform_error is not None:
-                            # If transfer failed, queue the error before the sentinel
-                            try:
-                                async_stream._queue.put_nowait(perform_error)
-                            except asyncio.QueueFull:
-                                pass
-                        # Always signal end of stream
-                        async_stream.signal_end_of_stream()
-                except Exception:
-                    context.response_body.close()
-                    raise
-                finally:
-                    self._transfers.pop(curl, None)
+                self._transfers.pop(curl, None)
 
-            # If perform() failed but we got a response (partial data received),
-            # we should still return the response and let the stream signal the error
-            if perform_error is not None:
-                if (
-                    async_stream is None
-                    or curl_response is None
-                    or curl_response.status_code == 0
-                ):
-                    # For non-streaming, no response, or error before response started: raise immediately
-                    curl.close()
-                    raise perform_error
-                # For streaming with status code and partial data: error was already queued, continue
-
-            curl.close()
+            curl_response = _finalize_curl_response(curl, context)
+            if perform_error is not None and curl_response.status_code == 0:
+                raise perform_error
 
             return httpx.Response(
                 status_code=curl_response.status_code,
                 headers=curl_response.headers,
-                stream=curl_response.body_stream
-                or _FileStream(curl_response.body_file),
+                stream=_FileStream(curl_response.body_file),
                 request=request,
                 extensions={"http_version": curl_response.http_version},
             )
+        except httpx.TransportError:
+            raise
         except pycurl.error as error:
             self._transfers.pop(curl, None)
             context.response_body.close()
-            curl.close()
+            try:
+                curl.close()
+            except Exception:
+                pass
             code, message = error.args
             raise _map_pycurl_error(code, str(message), curl) from error
         except Exception:
             self._transfers.pop(curl, None)
             context.response_body.close()
-            curl.close()
+            try:
+                curl.close()
+            except Exception:
+                pass
             raise
+
+    async def _finish_streaming(
+        self,
+        handle: PerformHandle,
+        context: _TransferContext,
+        async_stream: _AsyncQueueStream,
+        curl: pycurl.Curl,
+    ) -> None:
+        """Background coroutine that owns a transfer after early header return.
+
+        Waits for the transfer to finish, then signals end-of-stream so the
+        consumer of async_stream unblocks. Handles errors by queuing them.
+        """
+        try:
+            await self._curl.wait_for_completion(handle)
+        except pycurl.error as error:
+            code, message = error.args
+            perform_error = _map_pycurl_error(code, str(message), curl)
+            async_stream._queue.put_nowait(perform_error)
+        finally:
+            async_stream.signal_end_of_stream()
+            self._transfers.pop(curl, None)
+            context.response_body.close()
+            try:
+                curl.close()
+            except Exception:
+                pass
 
     async def aclose(self):
         if self._closed:
             return
         self._closed = True
 
-        # Close AsyncCurl
-        await self._curl.aclose()
+        # Close AsyncCurl if it was initialized
+        if self._curl is not None:
+            await self._curl.aclose()
 
         # Clean up any remaining transfers
         for curl, transfer in list(self._transfers.items()):

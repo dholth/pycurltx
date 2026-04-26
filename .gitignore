@@ -160,3 +160,6 @@ _version.py
 
 # codspeed
 .codspeed/
+
+# llm scratchpad
+llm/
